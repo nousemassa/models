@@ -1,0 +1,119 @@
+# Сервисы с МОДЕЛЯМИ и GPU: эмбеддинги (`embed`) и решатель (`solver`).
+#
+# **Почему отдельный композ.** У моделей своя жизнь: они поднимаются и перезапускаются независимо от
+# продукта, а GPU-задание к процессам и базам не относится. Здесь только службы с моделями.
+#
+# Использование:
+#   1) образы:   bash solver-image.sh  и  bash embed-image.sh   (контексты — ВНЕ репозитория, см. скрипты:
+#      исходники llama.cpp и решателя задаются переменными `LLAMA_SRC` и `SOLVER_SRC`)
+#   2) поднять:  bash gpu-up.sh        (снимает конкурирующие хостовые юниты и проверяет порты)
+#
+# **Почему строго последовательно.** Решатель занимает около 1,6 ГиБ видеопамяти, а остальное уже занято
+# моделью эмбеддингов: два экземпляра одновременно не помещаются. Поэтому переключение — «остановить
+# хостовую службу, затем поднять контейнер», а не параллельно.
+
+name: models
+
+networks:
+  platform:
+    external: true
+    name: ${PLATFORM_NETWORK:?PLATFORM_NETWORK не задан — имя общей сети платформы}
+
+services:
+  # СЕРВИС ЭМБЕДДИНГОВ: llama.cpp с CUDA; модель и ключ монтируются снаружи.
+  #
+  # **Почему в ЭТОМ композе.** Служба, которой нужна модель или GPU, живёт здесь; процессы и базы — в
+  # композах своих проектов. Тогда тяжёлую часть можно поднять и остановить отдельно, не задевая бота.
+  #
+  # **Порт публикуется только на 127.0.0.1.** Он нужен для хостовых проверок и ручных проб; наружу
+  # отдавать нечего. Внутри общей сети служба доступна по имени (`http://embed:8082/v1`) — публикация
+  # для этого не нужна.
+  embed:
+    image: ${EMBED_IMAGE:-models-embed:local}
+    restart: unless-stopped
+    volumes:
+      #: Модель и ключ монтируются в НЕЙТРАЛЬНЫЙ каталог `/models-src` — те же пути, что в `CMD` образа.
+      #: Путь на хосте задаётся окружением: в репозитории чужих абсолютных путей нет.
+      - ${EMBED_MODEL_FILE:?EMBED_MODEL_FILE не задан — путь к файлу модели}:/models-src/embeddinggemma-2-Q8_0.gguf:ro
+      - ${LLAMA_KEYS_FILE:?LLAMA_KEYS_FILE не задан — путь к файлу ключей}:/models-src/api_keys.txt:ro
+    ports:
+      - "127.0.0.1:8082:8082"
+    networks: [platform]
+    #: Лимит — по ПИКУ, а не по покою: пик cgroup около 662 МБ против 170 МБ в покое, поэтому `512m`
+    #: убил бы службу на первой же нагрузке.
+    mem_limit: 2g
+    memswap_limit: 2g
+    # GPU запрашивается способом, который понимает Compose 2.29.7 (ключ `gpus:` появился в 2.30).
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    logging:
+      driver: json-file
+      options: {max-size: "20m", max-file: "3"}
+    #: Проверка отвечает на ДВА вопроса сразу:
+    #:   1) эмбеддинг считается по делу — значит модель загружена И ключ принят (без ключа этот путь
+    #:      отдаёт 401: публичны только `/health` и `/v1/health`);
+    #:   2) GPU действительно занят — `nvidia-smi` приходит в контейнер от рантайма, а «поднялся на CPU с
+    #:      зелёным health» и есть тихий фолбэк, который запрещён флагом `--device CUDA0`.
+    # `$$(head …)` — чтобы compose не подставил переменную самому себе, а отдал команду шеллу контейнера.
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS -m 5 -X POST http://127.0.0.1:8082/v1/embeddings -H \"Authorization: Bearer $$(head -1 /models-src/api_keys.txt)\" -H 'Content-Type: application/json' -d '{\"input\":[\"health\"],\"model\":\"embed\"}' > /dev/null && nvidia-smi -L > /dev/null"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  solver:
+    #: Образ собирается скриптом `solver-image.sh`: контекст — каталог проекта-решателя, он живёт ВНЕ
+    #: репозитория (`SOLVER_SRC`). Имя службы — по роли, а не по модели.
+    image: ${SOLVER_IMAGE:-models-solver:local}
+    restart: unless-stopped
+    environment:
+      # В контейнере слушаем на всех интерфейсах: опубликованный порт приходит на eth0, а не на
+      # loopback контейнера (см. `JEV_HOST` в `jev_server.py`).
+      #: ❗ `JEV_HOST`/`JEV_PORT`/`JEV_QUANT`/`JEV_NGL` — переменные САМОГО сервера решателя: их читает его
+      #: код. Переименование заставило бы сервер взять умолчание `127.0.0.1`, контейнер стал бы
+      #: недостижим и ушёл в рестарт-петлю. Поэтому имена остаются его, а роль говорит имя нашей службы.
+      JEV_HOST: 0.0.0.0
+      JEV_PORT: "8083"
+      JEV_QUANT: ${JEV_QUANT:-Q8_0}
+      JEV_NGL: ${JEV_NGL:-8}
+      #: Куда монтируется ключ. Переменная НАША (`JEV_KEY_FILE` читает образ, см. `solver/Dockerfile`):
+      #: жёстко зашитый в коде решателя путь к файлу ключей перекрыт при сборке, иначе он задавал бы
+      #: раскладку каталогов внутри контейнера. Путь на хосте — только из окружения (`SOLVER_KEY_FILE`).
+      JEV_KEY_FILE: /keys/api_keys.txt
+    volumes:
+      #: Ключ общий у локальных сервисов, монтируется только на чтение, в НЕЙТРАЛЬНЫЙ каталог.
+      - ${SOLVER_KEY_FILE:?SOLVER_KEY_FILE не задан — путь к файлу ключей}:/keys/api_keys.txt:ro
+    ports:
+      #: Адрес не меняется (`http://127.0.0.1:8083` в `.env`): переключение на контейнер не тянет за собой
+      #: правки в клиенте.
+      - "127.0.0.1:8083:8083"
+    networks: [platform]
+    mem_limit: 3g
+    shm_size: 256m
+    # GPU запрашивается способом, который понимает Compose 2.29.7: ключ `gpus:` появился в 2.30,
+    # а `deploy.resources.reservations.devices` работает и здесь.
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    logging:
+      driver: json-file
+      options: {max-size: "20m", max-file: "3"}
+    healthcheck:
+      #: `/health` у решателя отдаётся без ключа и содержит `n_gpu_layers` — по нему видно, что модель
+      #: загружена именно на GPU, а не на CPU (тихая деградация была бы хуже отказа).
+      test: ["CMD", "python3", "-c", "import json,sys,urllib.request; d=json.load(urllib.request.urlopen('http://127.0.0.1:8083/health', timeout=10)); sys.exit(0 if d.get('ready') and int(d.get('n_gpu_layers') or 0) > 0 else 1)"]
+      interval: 30s
+      timeout: 15s
+      retries: 5
+      # Модель (1,9 ГиБ) читается с диска и загружается на GPU — старт не мгновенный.
+      start_period: 120s

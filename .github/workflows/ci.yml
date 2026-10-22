@@ -1,0 +1,31 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Композ разбирается
+        env:
+          PLATFORM_NETWORK: ci-network
+          EMBED_MODEL_FILE: /tmp/model.gguf
+          LLAMA_KEYS_FILE: /tmp/keys.txt
+          SOLVER_KEY_FILE: /tmp/keys.txt
+        run: >
+          docker compose --env-file .env.example -f compose.models.yaml config -q
+      - name: Лончеры и сборщики синтаксически целы
+        run: |
+          bash -n gpu-up.sh
+          bash -n embed-image.sh
+          bash -n solver-image.sh
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Зависимости
+        run: python -m pip install --quiet ruff
+      - name: Линтер
+        run: python -m ruff check .
